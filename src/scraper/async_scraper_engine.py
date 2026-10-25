@@ -261,6 +261,10 @@ class AsyncNewsScraperEngine:
         self.url_states = {}
         self.url_attempts = set()
         self.discovery_failures = {}
+        # Like URL deduplication, terminal skips last for this engine instance.
+        # A new engine starts a new run; ordinary failures remain retryable.
+        self.source_outcomes = {}
+        self._http_article_tasks = {}
 
         # Setup logging
         self.logger = logging.getLogger(__name__)
@@ -432,6 +436,29 @@ class AsyncNewsScraperEngine:
             self.semaphores[source.name] = asyncio.Semaphore(max_concurrent)
         return self.semaphores[source.name]
 
+    def _source_skipped(self, source: NewsSource) -> bool:
+        return self.source_outcomes.get(source.name, {}).get("status") == "skipped"
+
+    def _skip_captcha_source(self, source: NewsSource, url: str, stage: str):
+        """Stop this source without treating a challenge as a recoverable error."""
+        if not self._source_skipped(source):
+            self.source_outcomes[source.name] = {
+                "status": "skipped",
+                "reason": "captcha-required",
+                "url": url,
+                "stage": stage,
+            }
+            self.logger.warning(
+                "captcha-required, skipped source=%s url=%s stage=%s",
+                source.name, url, stage,
+            )
+        current = asyncio.current_task()
+        for task, link in tuple(self._http_article_tasks.get(source.name, {}).items()):
+            if not task.done():
+                self.url_states[link] = "skipped"
+                if task is not current:
+                    task.cancel()
+
     async def scrape_sources_async(self, sources: List[NewsSource]) -> List[Article]:
         """Scrape multiple sources concurrently."""
         self.logger.info("Starting async scraping of {0} sources".format(len(sources)))
@@ -469,10 +496,14 @@ class AsyncNewsScraperEngine:
         nothing is retried through Playwright in the same run, and repeated
         JS successes sticky-promote the source to JS-first.
         """
+        if self._source_skipped(source):
+            return []
         rate_limiter = self.get_rate_limiter(source)
         self.adaptive_rate.set_base(source.name, 1.0 / max(source.rate_limit, 0.1))
 
         async with rate_limiter:
+            if self._source_skipped(source):
+                return []
             try:
                 use_js = self.escalation.should_use_js(source.name, source.requires_js)
                 self.logger.info(
@@ -485,6 +516,8 @@ class AsyncNewsScraperEngine:
                     return articles
 
                 articles = await self.scrape_http_source(source)
+                if self._source_skipped(source):
+                    return articles
                 from .adaptive.escalation import ESCALATE
 
                 if (
@@ -509,10 +542,16 @@ class AsyncNewsScraperEngine:
         return extract_links(html, source)
 
     async def _attempt_article(self, backend, source, link, semaphore, context=None):
+        if self._source_skipped(source):
+            self.url_states[link] = "skipped"
+            return None
         self.url_states[link] = 'in-flight'
         self.url_attempts.add((backend, link))
         try:
             article = await (self.scrape_article_http(semaphore, source, link) if backend == 'http' else self.scrape_article_js(semaphore, context, source, link))
+            if self._source_skipped(source):
+                self.url_states[link] = "skipped"
+                return None
             if isinstance(article, Article):
                 self.seen_urls.add(link)
                 self.url_states[link] = 'succeeded'
@@ -520,16 +559,22 @@ class AsyncNewsScraperEngine:
                 self.url_states[link] = 'retryable-failed'
             return article
         finally:
-            if self.url_states.get(link) == 'in-flight':
+            if self._source_skipped(source):
+                self.url_states[link] = "skipped"
+            elif self.url_states.get(link) == 'in-flight':
                 self.url_states[link] = 'retryable-failed'
 
     async def scrape_http_source(self, source: NewsSource) -> List[Article]:
         """Scrape source using async HTTP requests."""
+        if self._source_skipped(source):
+            return []
         start_time = time.time()
 
         try:
             # Get article links
             links = await self.get_article_links_http(source)
+            if self._source_skipped(source):
+                return []
             self.logger.info("Found {0} links for {1}".format(len(links), source.name))
 
             # Scrape articles concurrently
@@ -542,15 +587,30 @@ class AsyncNewsScraperEngine:
                     task = asyncio.create_task(
                         self._attempt_article("http", source, link, semaphore)
                     )
+                    tracked = self._http_article_tasks.setdefault(source.name, {})
+                    tracked[task] = link
+                    task.add_done_callback(tracked.pop)
                     tasks.append(task)
 
             # Wait for all articles
-            articles = await asyncio.gather(*tasks, return_exceptions=True)
-
+            try:
+                articles = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                pending = [task for task in tasks if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
             # Filter successful results
             valid_articles = [
                 article for article in articles if isinstance(article, Article)
             ]
+            if self._source_skipped(source):
+                # Keep ordinary articles completed before the challenge. They
+                # are already in seen_urls and must not become undelivered data.
+                for article in valid_articles:
+                    self.monitor.record_article(source.name)
+                return valid_articles
 
             # Record performance
             response_time = time.time() - start_time
@@ -568,6 +628,8 @@ class AsyncNewsScraperEngine:
 
     async def get_article_links_http(self, source: NewsSource) -> List[str]:
         """Get article links using HTTP request with proxy and user agent rotation."""
+        if self._source_skipped(source):
+            return []
         try:
             # Rotate user agent
             headers = (
@@ -586,8 +648,13 @@ class AsyncNewsScraperEngine:
             ) as response:
                 if response.status == 200:
                     html = await response.text()
+                    if self._source_skipped(source):
+                        return []
                     # CAPTCHA detection (simple placeholder)
-                    if "captcha" in html.lower() and self.captcha_solver:
+                    if "captcha" in html.lower():
+                        if self.captcha_solver is None:
+                            self._skip_captcha_source(source, source.base_url, "discovery")
+                            return []
                         self.logger.warning(
                             "CAPTCHA detected on {0}, attempting to solve...".format(
                                 source.base_url
@@ -619,10 +686,14 @@ class AsyncNewsScraperEngine:
     ) -> Optional[Article]:
         """Scrape individual article using HTTP."""
         async with semaphore:
+            if self._source_skipped(source):
+                return None
             # Adaptive pacing (#884): wait this source's learned delay, then
             # feed the outcome back so pressure (429/503/slow/errors) backs
             # off and sustained success decays toward the configured base.
             await asyncio.sleep(self.adaptive_rate.next_delay(source.name))
+            if self._source_skipped(source):
+                return None
             started = time.monotonic()
             try:
                 # Rotate user agent
@@ -647,8 +718,13 @@ class AsyncNewsScraperEngine:
                     )
                     if response.status == 200:
                         html = await response.text()
+                        if self._source_skipped(source):
+                            return None
                         # CAPTCHA detection (simple placeholder)
-                        if "captcha" in html.lower() and self.captcha_solver:
+                        if "captcha" in html.lower():
+                            if self.captcha_solver is None:
+                                self._skip_captcha_source(source, url, "article")
+                                return None
                             self.logger.warning(
                                 "CAPTCHA detected on {0}, attempting to solve...".format(
                                     url
@@ -662,7 +738,7 @@ class AsyncNewsScraperEngine:
                         article = await loop.run_in_executor(
                             self.thread_pool, self.parse_article_html, html, url, source
                         )
-                        return article
+                        return None if self._source_skipped(source) else article
                     else:
                         self.logger.warning(
                             "HTTP {0} for {1}".format(response.status, url)
@@ -677,6 +753,8 @@ class AsyncNewsScraperEngine:
         self, html: str, url: str, source: NewsSource
     ) -> Optional[Article]:
         """Parse article from HTML (runs in thread pool)."""
+        if self._source_skipped(source):
+            return None
         from bs4 import BeautifulSoup
 
         try:
@@ -744,6 +822,8 @@ class AsyncNewsScraperEngine:
 
     async def scrape_js_source(self, source: NewsSource) -> List[Article]:
         """Scrape JavaScript-heavy source using Playwright."""
+        if self._source_skipped(source):
+            return []
         if not self.browser_contexts:
             self.logger.warning(
                 "No browser contexts available for {0}".format(source.name)

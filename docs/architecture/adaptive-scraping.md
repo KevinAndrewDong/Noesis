@@ -76,6 +76,16 @@ outcome-adaptive, with the decisions in pure-logic policies:
   retried through the browser in the same run; `promote_after` consecutive JS
   successes sticky-promote the source to JS-first, and consecutive empty JS
   passes demote it (consecutive evidence both ways — no flapping).
+  A credentialless HTTP CAPTCHA response is instead terminal: the engine records
+  `reason=captcha-required`, `status=skipped`, stops that source's pending article
+  tasks, and excludes it from escalation. This uses the existing CAPTCHA signal;
+  it does not solve challenges or extend detection to JS-first sources. The skip
+  lasts for the engine instance, like URL deduplication; a new engine starts a new
+  run. Other sources and ordinary empty-page/error recovery are unaffected.
+  Requests or parser work already started before detection cannot be undone;
+  cancelled work is drained and late article results from that source are ignored.
+  Ordinary articles fully completed before detection remain in the returned
+  results, preserving their existing successful URL deduplication state.
 - **AIMD rate limiting.** Each source has a learned inter-request delay:
   429/503/errors/slow responses multiply it (bounded), successes decay it
   back to the configured floor (`1 / rate_limit`). Sources are isolated — a
